@@ -71,27 +71,34 @@ class DiagnosticBus:
         with cls._lock:
             if cls._instance is None:
                 cls._instance = super().__new__(cls)
-                cls._instance._entries = []
-                cls._instance._depth = 0
-                cls._instance._verbose = True
+                cls._instance._local = threading.local()
             return cls._instance
 
+    @property
+    def _state(self):
+        if not hasattr(self._local, 'entries'):
+            self._local.entries = []
+            self._local.depth = 0
+            self._local.verbose = True
+        return self._local
+
     def set_verbose(self, verbose: bool):
-        self._verbose = verbose
+        self._state.verbose = verbose
 
     def emit(self, source: str, message: str, data: Optional[Dict] = None):
-        if not self._verbose:
+        state = self._state
+        if not state.verbose:
             return
-        indent = "  " * self._depth
+        indent = "  " * state.depth
         timestamp = time.perf_counter()
         entry = {
             "t": timestamp,
             "source": source,
             "message": message,
             "data": data or {},
-            "depth": self._depth
+            "depth": state.depth
         }
-        self._entries.append(entry)
+        state.entries.append(entry)
         data_str = ""
         if data:
             data_str = " | " + " | ".join(f"{k}={_fmt(v)}" for k, v in data.items())
@@ -99,10 +106,11 @@ class DiagnosticBus:
 
     def enter_scope(self, source: str, message: str, data: Optional[Dict] = None):
         self.emit(source, f"ENTER {message}", data)
-        self._depth += 1
+        self._state.depth += 1
 
     def exit_scope(self, source: str, message: str, data: Optional[Dict] = None):
-        self._depth = max(0, self._depth - 1)
+        state = self._state
+        state.depth = max(0, state.depth - 1)
         self.emit(source, f"EXIT {message}", data)
 
     def assertion(self, source: str, condition: bool, description: str, data: Optional[Dict] = None):
@@ -112,13 +120,14 @@ class DiagnosticBus:
             raise VerificationError(f"Assertion failed in {source}: {description}")
 
     def get_log(self) -> List[Dict]:
-        return list(self._entries)
+        return list(self._state.entries)
 
     def get_stats(self) -> Dict:
-        assertions = [e for e in self._entries if "ASSERT" in e["message"]]
+        entries = self._state.entries
+        assertions = [e for e in entries if "ASSERT" in e["message"]]
         passes = [e for e in assertions if "[PASS]" in e["message"]]
         return {
-            "total_entries": len(self._entries),
+            "total_entries": len(entries),
             "total_assertions": len(assertions),
             "passed": len(passes),
             "failed": len(assertions) - len(passes)
@@ -148,6 +157,9 @@ class UnitCircleRotationalDynamics:
     def so4_rotation_matrix(self, theta1: float, theta2: float,
                             plane1: Tuple[int, int] = (0, 1),
                             plane2: Tuple[int, int] = (2, 3)) -> np.ndarray:
+        if not (all(0 <= i <= 3 for i in plane1) and all(0 <= i <= 3 for i in plane2)):
+             raise VerificationError("Plane indices must be within [0, 3]")
+
         R = np.eye(4, dtype=np.float64)
         for theta, (i, j) in [(theta1, plane1), (theta2, plane2)]:
             Ri = np.eye(4)
@@ -155,6 +167,17 @@ class UnitCircleRotationalDynamics:
             Ri[i, i], Ri[i, j] = c, -s
             Ri[j, i], Ri[j, j] = s, c
             R = R @ Ri
+
+        # Validation
+        is_orthogonal = np.allclose(R @ R.T, np.eye(4), atol=1e-12)
+        det = np.linalg.det(R)
+        is_special = np.isclose(det, 1.0, atol=1e-12)
+
+        if not is_orthogonal:
+            raise VerificationError("Constructed matrix is not orthogonal")
+        if not is_special:
+            raise VerificationError(f"Constructed matrix determinant is {det}, expected +1")
+
         return R
 
     def evolve(self, x: np.ndarray, R: np.ndarray, iterations: int = 100) -> Tuple[np.ndarray, int, List]:
@@ -192,19 +215,33 @@ class DataContract:
 
     def validate(self, data: Dict[str, Any], direction: str = "output") -> Dict[str, Any]:
         BUS.enter_scope(f"Contract[{self.name}]", f"validate {direction}")
-        for spec in self.fields:
-            if spec.name not in data:
-                BUS.assertion(self.name, spec.nullable, f"Missing required field: {spec.name}")
-                continue
-            val = data[spec.name]
-            if val is not None:
+        try:
+            for spec in self.fields:
+                if spec.name not in data:
+                    BUS.assertion(self.name, spec.nullable, f"Missing required field: {spec.name}")
+                    continue
+                val = data[spec.name]
+                if val is None:
+                    BUS.assertion(self.name, spec.nullable, f"Field {spec.name} is None but not nullable")
+                    continue
+
                 BUS.assertion(self.name, isinstance(val, spec.dtype), f"Type mismatch for {spec.name}")
                 if spec.shape and hasattr(val, 'shape'):
                     BUS.assertion(self.name, val.shape == spec.shape, f"Shape mismatch for {spec.name}")
-        for i, inv in enumerate(self.invariants):
-            BUS.assertion(self.name, inv(data), f"Invariant failed: {self.descriptions[i]}")
-        BUS.exit_scope(f"Contract[{self.name}]", "passed")
-        return data
+
+                if spec.range_min is not None:
+                    BUS.assertion(self.name, np.all(val >= spec.range_min), f"Value below range_min for {spec.name}")
+                if spec.range_max is not None:
+                    BUS.assertion(self.name, np.all(val <= spec.range_max), f"Value above range_max for {spec.name}")
+                if spec.unit_norm:
+                    norm = np.linalg.norm(val)
+                    BUS.assertion(self.name, np.isclose(norm, 1.0, atol=1e-6), f"Value {spec.name} is not unit norm")
+
+            for i, inv in enumerate(self.invariants):
+                BUS.assertion(self.name, inv(data), f"Invariant failed: {self.descriptions[i]}")
+            return data
+        finally:
+            BUS.exit_scope(f"Contract[{self.name}]", "complete")
 
 # ==============================================================================
 # 3. SPARSE STORAGE FORMATS
@@ -214,6 +251,10 @@ class DCSR:
     """Double Compressed Sparse Row."""
     def __init__(self, nrows: int, ncols: int, dense: Optional[np.ndarray] = None):
         self.nrows, self.ncols = nrows, ncols
+        self.row_indices = np.array([], dtype=np.int32)
+        self.row_ptr = np.zeros(1, dtype=np.int32)
+        self.col_indices = np.array([], dtype=np.int32)
+        self.values = np.array([], dtype=np.float64)
         if dense is not None:
             nz_rows = [i for i in range(nrows) if np.any(dense[i])]
             self.row_indices = np.array(nz_rows, dtype=np.int32)
@@ -235,6 +276,8 @@ class DCSR:
         return res
 
     def matvec(self, x: np.ndarray) -> np.ndarray:
+        if x.shape[0] != self.ncols:
+            raise VerificationError(f"Dimension mismatch: x has {x.shape[0]} elements, expected {self.ncols}")
         res = np.zeros(self.nrows)
         for idx, i in enumerate(self.row_indices):
             start, end = self.row_ptr[idx], self.row_ptr[idx+1]
@@ -245,6 +288,10 @@ class DCSC:
     """Double Compressed Sparse Column."""
     def __init__(self, nrows: int, ncols: int, dense: Optional[np.ndarray] = None):
         self.nrows, self.ncols = nrows, ncols
+        self.col_indices = np.array([], dtype=np.int32)
+        self.col_ptr = np.zeros(1, dtype=np.int32)
+        self.row_indices = np.array([], dtype=np.int32)
+        self.values = np.array([], dtype=np.float64)
         if dense is not None:
             nz_cols = [j for j in range(ncols) if np.any(dense[:, j])]
             self.col_indices = np.array(nz_cols, dtype=np.int32)
@@ -305,26 +352,44 @@ class FFNBlockNP:
 class CoDAGQAL:
     """NumPy implementation of Attention with Landmarks."""
     def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, n_landmarks: int):
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be evenly divisible by n_heads ({n_heads})")
+        if n_heads % n_kv_heads != 0:
+            raise ValueError(f"n_heads ({n_heads}) must be evenly divisible by n_kv_heads ({n_kv_heads})")
         self.d_model, self.n_heads, self.n_kv_heads, self.n_landmarks = d_model, n_heads, n_kv_heads, n_landmarks
         self.d_head = d_model // n_heads
-        self.W_q1 = np.random.randn(d_model, d_model) * 0.02
-        self.W_q2 = np.random.randn(d_model, d_model) * 0.02
+        self.W_q1 = np.random.randn(d_model, (n_heads * self.d_head)) * 0.02
+        self.W_q2 = np.random.randn(d_model, (n_heads * self.d_head)) * 0.02
         self.W_k = np.random.randn(d_model, (n_kv_heads * self.d_head)) * 0.02
         self.W_v = np.random.randn(d_model, (n_kv_heads * self.d_head)) * 0.02
-        self.W_o = np.random.randn(d_model, d_model) * 0.02
+        self.W_o = np.random.randn(n_heads * self.d_head, d_model) * 0.02
 
     def forward(self, x: np.ndarray) -> np.ndarray:
-        # Simplified forward pass for simulation
-        Q = x @ (self.W_q1 - self.W_q2)
-        K = x @ self.W_k
-        V = x @ self.W_v
-        # Full attention is O(N^2), landmarks would make it O(N*L)
-        # Here we do a standard dot-product attention for demonstration
-        scores = (Q @ K.T) / math.sqrt(self.d_head)
+        seq_len = x.shape[0]
+        Q = (x @ (self.W_q1 - self.W_q2)).reshape(seq_len, self.n_heads, self.d_head)
+        K = (x @ self.W_k).reshape(seq_len, self.n_kv_heads, self.d_head)
+        V = (x @ self.W_v).reshape(seq_len, self.n_kv_heads, self.d_head)
+
+        # Grouped-Query Attention: broadcast K, V from n_kv_heads to n_heads
+        n_groups = self.n_heads // self.n_kv_heads
+        K = np.repeat(K, n_groups, axis=1) # (seq, n_heads, d_head)
+        V = np.repeat(V, n_groups, axis=1) # (seq, n_heads, d_head)
+
+        # Scaled dot-product attention per head
+        # Q: (seq, heads, d_head), K: (seq, heads, d_head)
+        # We want scores: (heads, seq, seq)
+        Q = Q.transpose(1, 0, 2) # (heads, seq, d_head)
+        K = K.transpose(1, 0, 2) # (heads, seq, d_head)
+        V = V.transpose(1, 0, 2) # (heads, seq, d_head)
+
+        scores = (Q @ K.transpose(0, 2, 1)) / math.sqrt(self.d_head)
         probs = np.exp(scores - np.max(scores, axis=-1, keepdims=True))
         probs /= probs.sum(axis=-1, keepdims=True)
-        out = (probs @ V) @ self.W_o.T
-        return out
+
+        context = (probs @ V) # (heads, seq, d_head)
+        context = context.transpose(1, 0, 2).reshape(seq_len, -1) # (seq, heads * d_head)
+
+        return context @ self.W_o
 
 class LateInteractionRetriever:
     """ColBERT-style MaxSim retriever."""
@@ -367,24 +432,42 @@ class FactRecord:
     influence: float = 1.0
 
     def advance(self):
-        if self.stage == ConsolidationStage.NEW: self.stage = ConsolidationStage.ACTIVE; self.influence = 0.8
-        elif self.stage == ConsolidationStage.ACTIVE: self.stage = ConsolidationStage.CONSOLIDATED; self.influence = 0.3
-        elif self.stage == ConsolidationStage.CONSOLIDATED: self.stage = ConsolidationStage.DISSOLVED; self.influence = 0.0
+        if self.stage == ConsolidationStage.NEW:
+            self.stage = ConsolidationStage.ACTIVE
+            self.influence = 0.8
+        elif self.stage == ConsolidationStage.ACTIVE:
+            self.stage = ConsolidationStage.CONSOLIDATED
+            self.influence = 0.3
+        elif self.stage == ConsolidationStage.CONSOLIDATED:
+            self.stage = ConsolidationStage.DISSOLVED
+            self.influence = 0.0
         return self.stage != ConsolidationStage.DISSOLVED
 
 class MEMITEngine:
     """Mass-Editing Memory In Transformers with covariance constraints."""
     def __init__(self, d_in: int, d_out: int, lambda_reg: float = 1.0):
+        if lambda_reg <= 0:
+            raise VerificationError("lambda_reg must be positive")
         self.d_in, self.d_out, self.lambda_reg = d_in, d_out, lambda_reg
         self.W = np.random.randn(d_out, d_in) * 0.01
         self.C = np.zeros((d_in, d_in))
         self.facts: List[FactRecord] = []
 
     def edit_fact(self, fact_id: str, k: np.ndarray, v: np.ndarray):
+        if k.shape != (self.d_in,):
+            raise VerificationError(f"k shape {k.shape} does not match d_in {self.d_in}")
+        if v.shape != (self.d_out,):
+            raise VerificationError(f"v shape {v.shape} does not match d_out {self.d_out}")
+
         k, v = k.astype(np.float64), v.astype(np.float64)
         residual = v - self.W @ k
-        C_reg_inv = np.linalg.inv(self.C + self.lambda_reg * np.eye(self.d_in))
-        delta_W = np.outer(residual, C_reg_inv @ k)
+
+        # Numerically stable linear solve instead of explicit inversion
+        # C_reg_inv @ k is x in (self.C + self.lambda_reg * I) @ x = k
+        A = self.C + self.lambda_reg * np.eye(self.d_in)
+        k_transformed = np.linalg.solve(A, k)
+
+        delta_W = np.outer(residual, k_transformed)
         self.W += delta_W
         self.C += np.outer(k, k)
         self.facts.append(FactRecord(fact_id, k, v, delta_W))
@@ -407,6 +490,11 @@ class SimplicialComplex:
         self._boundary_cache = {}
 
     def add_simplex(self, vertices: Tuple[int, ...]):
+        if not vertices:
+            return
+        if len(set(vertices)) != len(vertices):
+            return
+
         k = len(vertices) - 1
         v_sorted = tuple(sorted(vertices))
         if v_sorted not in self.simplices[k]:
@@ -416,9 +504,12 @@ class SimplicialComplex:
                     self.add_simplex(v_sorted[:i] + v_sorted[i+1:])
 
     def boundary_operator(self, k: int) -> np.ndarray:
-        if k <= 0 or not self.simplices[k]: return np.zeros((1, len(self.simplices.get(k, [0]))))
-        n_km1 = len(self.simplices[k-1])
         n_k = len(self.simplices[k])
+        n_km1 = len(self.simplices[k-1]) if k > 0 else 0
+
+        if k <= 0 or not self.simplices[k]:
+            return np.zeros((n_km1, n_k))
+
         B = np.zeros((n_km1, n_k))
         idx_km1 = {s: i for i, s in enumerate(self.simplices[k-1])}
         for j, sigma in enumerate(self.simplices[k]):
@@ -483,17 +574,20 @@ class SequentialReasoner:
 
     def assume(self, premise: str, confidence: float = 1.0) -> ReasoningStep:
         s = ReasoningStep(self.step_counter, premise, "ASSUME", premise, confidence)
-        self.chain.append(s); self.step_counter += 1
+        self.chain.append(s)
+        self.step_counter += 1
         return s
 
     def deduce(self, parent: ReasoningStep, rule: str, conclusion: str, factor: float = 0.95) -> ReasoningStep:
         s = ReasoningStep(self.step_counter, parent.conclusion, "DEDUCE", conclusion, parent.confidence * factor, parent_step=parent.step_id)
-        self.chain.append(s); self.step_counter += 1
+        self.chain.append(s)
+        self.step_counter += 1
         return s
 
     def conclude(self, parent: ReasoningStep, conclusion: str) -> ReasoningStep:
         s = ReasoningStep(self.step_counter, parent.conclusion, "CONCLUDE", conclusion, parent.confidence, parent_step=parent.step_id)
-        self.chain.append(s); self.step_counter += 1
+        self.chain.append(s)
+        self.step_counter += 1
         return s
 
 # ==============================================================================
@@ -535,6 +629,8 @@ if HAS_TORCH:
 
         def forward(self, x):
             b, t = x.shape
+            if t > 1024:
+                raise VerificationError(f"Sequence length {t} exceeds maximum of 1024")
             h = self.embed(x) + self.pos[:, :t, :]
             for block in self.blocks: h = block(h)
             return self.head(self.ln_f(h))
@@ -569,19 +665,47 @@ class TensegrityTrainer:
 
     def train(self, loader, val_loader):
         BUS.enter_scope("Trainer", "loop")
+        data_iter = iter(loader)
+        val_iter = iter(val_loader)
         for step in range(self.max_steps):
             self.model.train()
             # Mini-step
-            x, y = next(iter(loader))
+            try:
+                x, y = next(data_iter)
+            except StopIteration:
+                data_iter = iter(loader)
+                x, y = next(data_iter)
+
             logits = self.model(x.to(self.device))
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.to(self.device).view(-1))
-            self.opt.zero_grad(); loss.backward(); self.opt.step()
+            self.opt.zero_grad()
+            loss.backward()
+            self.opt.step()
+
+            # Validation loss
+            self.model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                try:
+                    vx, vy = next(val_iter)
+                except StopIteration:
+                    val_iter = iter(val_loader)
+                    try:
+                        vx, vy = next(val_iter)
+                    except StopIteration:
+                        vx, vy = None, None
+
+                if vx is not None:
+                    v_logits = self.model(vx.to(self.device))
+                    val_loss = F.cross_entropy(v_logits.view(-1, v_logits.size(-1)), vy.to(self.device).view(-1)).item()
 
             # Record state
-            state = TrainingState(step, loss.item(), loss.item(), 0.01, 1.0)
+            state = TrainingState(step, loss.item(), val_loss, 0.01, 1.0)
             self.history.append(state)
-            for p in self.ltl: p.verify(self.history)
-            if step % 10 == 0: BUS.emit("Trainer", f"Step {step}", {"loss": loss.item()})
+            for p in self.ltl:
+                p.verify(self.history)
+            if step % 10 == 0:
+                BUS.emit("Trainer", f"Step {step}", {"loss": loss.item(), "val_loss": val_loss})
         BUS.exit_scope("Trainer", "complete")
 
 class SelfTrainingLoop:
@@ -603,7 +727,12 @@ class SelfTrainingLoop:
             self.model.gamma -= self.lr * 0.01
             state = TrainingState(i, loss, loss, self.lr, 0.1)
             history.append(state)
-            if loss < self.eps: state.converged = True; break
+            # Invoke LTL verification
+            for p in self.ltl_properties:
+                p.verify(history)
+            if loss < self.eps:
+                state.converged = True
+                break
         BUS.exit_scope("SelfTrainingLoop", "complete")
         return history
 
@@ -633,8 +762,9 @@ class TrainableAIEngine:
         # 1. Rotational
         x0 = np.array([1, 0, 0, 0], dtype=np.float64)
         R = self.rotational.so4_rotation_matrix(0.1, 0.2)
-        xf, steps, _ = self.rotational.evolve(x0, R)
-        results["rotational"] = {"converged": True, "steps": steps}
+        xf, steps, traj = self.rotational.evolve(x0, R)
+        converged = len(traj) > 0 and traj[-1]["displacement"] < self.rotational.convergence_eps
+        results["rotational"] = {"converged": converged, "steps": steps}
 
         # 2. Sparse
         dense = np.random.randn(10, 10) * (np.random.rand(10, 10) > 0.8)
