@@ -352,6 +352,10 @@ class FFNBlockNP:
 class CoDAGQAL:
     """NumPy implementation of Attention with Landmarks."""
     def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, n_landmarks: int):
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be evenly divisible by n_heads ({n_heads})")
+        if n_heads % n_kv_heads != 0:
+            raise ValueError(f"n_heads ({n_heads}) must be evenly divisible by n_kv_heads ({n_kv_heads})")
         self.d_model, self.n_heads, self.n_kv_heads, self.n_landmarks = d_model, n_heads, n_kv_heads, n_landmarks
         self.d_head = d_model // n_heads
         self.W_q1 = np.random.randn(d_model, (n_heads * self.d_head)) * 0.02
@@ -698,8 +702,10 @@ class TensegrityTrainer:
             # Record state
             state = TrainingState(step, loss.item(), val_loss, 0.01, 1.0)
             self.history.append(state)
-            for p in self.ltl: p.verify(self.history)
-            if step % 10 == 0: BUS.emit("Trainer", f"Step {step}", {"loss": loss.item(), "val_loss": val_loss})
+            for p in self.ltl:
+                p.verify(self.history)
+            if step % 10 == 0:
+                BUS.emit("Trainer", f"Step {step}", {"loss": loss.item(), "val_loss": val_loss})
         BUS.exit_scope("Trainer", "complete")
 
 class SelfTrainingLoop:
